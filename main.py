@@ -683,6 +683,20 @@ QComboBox QAbstractItemView {
     selection-color: #a0c4ff;
     outline: none;
 }
+QPushButton#subBtn {
+    background-color: #16213e;
+    color: #a0c4ff;
+    border: 1px solid #0f3460;
+    border-radius: 6px;
+    padding: 8px 14px;
+    font-size: 12px;
+}
+QPushButton#subBtn:hover { background-color: #1a4a7a; }
+QPushButton#subBtn:checked {
+    background-color: #1a3a1a;
+    color: #6aff6a;
+    border: 1px solid #2a5a2a;
+}
 """
 
 
@@ -731,6 +745,8 @@ class MainWindow(QMainWindow):
         self._probe_data = None
         self._last_probed_uri = ""
         self._selected_audio_index = -1
+        self._subtitle_tracks = []
+        self._sub_last_track_ids = ()
 
         central = QWidget()
         central.setObjectName("centralWidget")
@@ -827,6 +843,24 @@ class MainWindow(QMainWindow):
         self.audio_track_combo.currentIndexChanged.connect(self._on_audio_track_changed)
         audio_track_row.addWidget(self.audio_track_combo, stretch=1)
         content_layout.addLayout(audio_track_row)
+
+        sub_row = QHBoxLayout()
+        self.sub_label = QLabel("Subtitles:")
+        self.sub_label.setStyleSheet("color: #888; font-size: 12px;")
+        sub_row.addWidget(self.sub_label)
+        self.sub_combo = QComboBox()
+        self.sub_combo.setMinimumWidth(260)
+        self.sub_combo.addItem("No subtitles", -1)
+        self.sub_combo.setEnabled(False)
+        self.sub_combo.currentIndexChanged.connect(self._on_sub_changed)
+        sub_row.addWidget(self.sub_combo, stretch=1)
+        self.sub_btn = QPushButton("Subs: ON")
+        self.sub_btn.setCheckable(True)
+        self.sub_btn.setChecked(True)
+        self.sub_btn.setObjectName("subBtn")
+        self.sub_btn.toggled.connect(self._on_sub_toggle)
+        sub_row.addWidget(self.sub_btn)
+        content_layout.addLayout(sub_row)
 
         time_row = QHBoxLayout()
         self.time_label = QLabel("00:00 / 00:00")
@@ -1028,6 +1062,81 @@ class MainWindow(QMainWindow):
             selected_audio_track = -1
         print(f"[AUDIO] Track selected: index={self._selected_audio_index}, global={selected_audio_track}")
 
+    def _check_subtitle_tracks(self):
+        """Poll mpv track_list and update subtitle combo if tracks changed."""
+        if not self._player:
+            return
+        try:
+            track_list = self._player.track_list
+        except Exception:
+            return
+        if not track_list:
+            return
+        subs = [t for t in track_list if t.get("type") == "sub"]
+        new_ids = tuple(t.get("id", 0) for t in subs)
+        if new_ids == self._sub_last_track_ids:
+            self._sync_sub_selection()
+            return
+        self._sub_last_track_ids = new_ids
+        self._subtitle_tracks = subs
+        self.sub_combo.blockSignals(True)
+        self.sub_combo.clear()
+        if not subs:
+            self.sub_combo.addItem("No subtitles", -1)
+            self.sub_combo.setEnabled(False)
+        else:
+            self.sub_combo.addItem("Off", 0)
+            for t in subs:
+                lang = (t.get("lang") or t.get("title") or "").upper() or f"Track {t['id']}"
+                codec = t.get("codec_name", t.get("codec", ""))
+                label = f"{lang} ({codec})" if codec else lang
+                self.sub_combo.addItem(label, t["id"])
+            self.sub_combo.setEnabled(True)
+        self._sync_sub_selection()
+        self.sub_combo.blockSignals(False)
+
+    def _sync_sub_selection(self):
+        """Sync combo selection and toggle button to current mpv subtitle state."""
+        if not self._player:
+            return
+        try:
+            current_sid = self._player.sid or 0
+        except Exception:
+            current_sid = 0
+        idx = self.sub_combo.findData(current_sid)
+        if idx >= 0 and idx != self.sub_combo.currentIndex():
+            self.sub_combo.blockSignals(True)
+            self.sub_combo.setCurrentIndex(idx)
+            self.sub_combo.blockSignals(False)
+        try:
+            vis = self._player.sub_visibility
+            if vis != self.sub_btn.isChecked():
+                self.sub_btn.blockSignals(True)
+                self.sub_btn.setChecked(vis)
+                self.sub_btn.blockSignals(False)
+        except Exception:
+            pass
+
+    def _on_sub_changed(self, index):
+        tid = self.sub_combo.itemData(index)
+        if tid is None or not self._player:
+            return
+        try:
+            self._player.sid = tid
+            print(f"[SUB] Track set to sid={tid}")
+        except Exception as e:
+            print(f"[SUB] Error setting sid: {e}")
+
+    def _on_sub_toggle(self, checked):
+        if not self._player:
+            return
+        try:
+            self._player.sub_visibility = checked
+            self.sub_btn.setText("Subs: ON" if checked else "Subs: OFF")
+            print(f"[SUB] Visibility: {'ON' if checked else 'OFF'}")
+        except Exception as e:
+            print(f"[SUB] Error toggling visibility: {e}")
+
     def _ensure_player(self):
         if self._player is not None:
             return True
@@ -1121,6 +1230,7 @@ class MainWindow(QMainWindow):
     def _poll_position(self):
         if not self._player:
             return
+        self._check_subtitle_tracks()
         if getattr(self, '_is_live', False):
             self.time_label.setText("LIVE / --:--")
             return
@@ -1328,6 +1438,17 @@ class MainWindow(QMainWindow):
         self._current_uri = None
         self._is_live = False
         self._resolved_audio_url = None
+        self._subtitle_tracks = []
+        self._sub_last_track_ids = ()
+        self.sub_combo.blockSignals(True)
+        self.sub_combo.clear()
+        self.sub_combo.addItem("No subtitles", -1)
+        self.sub_combo.setEnabled(False)
+        self.sub_combo.blockSignals(False)
+        self.sub_btn.blockSignals(True)
+        self.sub_btn.setChecked(True)
+        self.sub_btn.setText("Subs: ON")
+        self.sub_btn.blockSignals(False)
         self.seek_slider.setEnabled(True)
         with ffmpeg_lock:
             if ffmpeg_process:

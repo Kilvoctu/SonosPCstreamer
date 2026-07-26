@@ -31,7 +31,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from PyQt5.QtCore import Qt, QTimer, QPoint, QRect, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-    QPushButton, QSlider, QVBoxLayout, QWidget,
+    QPushButton, QSlider, QSpinBox, QVBoxLayout, QWidget,
 )
 
 load_dotenv()
@@ -262,7 +262,7 @@ def set_audio_stream(uri, seek_sec=0):
 
 def resolve_media_url(url):
     """Resolve a media URL to direct video + audio CDN URLs.
-    
+
     Returns (video_url, audio_url, title, duration, is_live, video_headers) or
     (None, None, None, 0, False, {}) on failure.
     """
@@ -313,7 +313,7 @@ def resolve_media_url(url):
 
 def resolve_embed_url(url):
     """Detect known streaming-site URL patterns and reconstruct their embed URL.
-    
+
     Returns a single embed URL string, or None if not applicable.
     """
     try:
@@ -327,7 +327,7 @@ def resolve_embed_url(url):
 
 def scrape_page_for_media(url):
     """Fetch a page and extract a playable media URL from its HTML.
-    
+
     Handles JS-rendered video players that yt-dlp cannot parse.
     Returns a direct media URL string, an iframe embed URL for further
     scraping, or None if nothing is found.
@@ -462,6 +462,28 @@ QPushButton#hdrBtn:checked {
     color: #6aff6a;
     border: 1px solid #2a5a2a;
 }
+QSpinBox {
+    background-color: #0a0f1e;
+    color: #eee;
+    border: 1px solid #0f3460;
+    border-radius: 4px;
+    padding: 4px 6px;
+    font-size: 12px;
+}
+QSpinBox:focus { border-color: #a0c4ff; }
+QSpinBox:disabled {
+    background-color: #1a2540;
+    color: #555;
+    border-color: #1a2540;
+}
+QSpinBox::up-button, QSpinBox::down-button {
+    background-color: #0f3460;
+    border: none;
+    width: 16px;
+}
+QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+    background-color: #1a4a7a;
+}
 """
 
 
@@ -499,6 +521,7 @@ class MainWindow(QMainWindow):
         self._RESIZE_MARGIN = 6
         self._is_live = False
         self._hdr_enabled = load_settings().get("hdr_enabled", False)
+        self._nits = load_settings().get("nits", 1000)
         self._sync_ready = False
         self._initial_sync_done = False
         self._current_speed = 1.0
@@ -575,6 +598,17 @@ class MainWindow(QMainWindow):
         self.hdr_btn.setObjectName("hdrBtn")
         self.hdr_btn.toggled.connect(self._toggle_hdr)
         transport_row.addWidget(self.hdr_btn)
+        self.nits_label = QLabel(" Nits:")
+        self.nits_label.setStyleSheet("color: #888; font-size: 12px;")
+        transport_row.addWidget(self.nits_label)
+        self.nits_spin = QSpinBox()
+        self.nits_spin.setRange(200, 10000)
+        self.nits_spin.setSingleStep(50)
+        self.nits_spin.setValue(self._nits)
+        self.nits_spin.setFixedWidth(80)
+        self.nits_spin.setEnabled(self._hdr_enabled)
+        self.nits_spin.valueChanged.connect(self._on_nits_changed)
+        transport_row.addWidget(self.nits_spin)
         transport_row.addStretch()
         content_layout.addLayout(transport_row)
 
@@ -730,7 +764,8 @@ class MainWindow(QMainWindow):
             if self._hdr_enabled:
                 self._player.target_prim = "bt.2020"
                 self._player.target_trc = "pq"
-                print("[MPV] HDR target: bt.2020/pq")
+                self._player.target_peak = self._nits
+                print(f"[MPV] HDR target: bt.2020/pq, {self._nits}nits")
             else:
                 print("[MPV] HDR target: default (SDR)")
             self._player.target_colorspace_hint = "yes"
@@ -745,9 +780,16 @@ class MainWindow(QMainWindow):
     def _toggle_hdr(self, checked):
         self._hdr_enabled = checked
         self.hdr_btn.setText("HDR: ON" if checked else "HDR: OFF")
-        save_settings({"hdr_enabled": checked})
+        self.nits_spin.setEnabled(checked)
+        save_settings({"hdr_enabled": checked, "nits": self._nits})
         self._apply_hdr_settings()
         print(f"[HDR] Toggle: {'ON' if checked else 'OFF'}")
+
+    def _on_nits_changed(self, value):
+        self._nits = value
+        save_settings({"hdr_enabled": self._hdr_enabled, "nits": self._nits})
+        self._apply_hdr_settings()
+        print(f"[HDR] Nits set to {value}")
 
     def _apply_hdr_settings(self):
         if not self._player:
@@ -756,9 +798,11 @@ class MainWindow(QMainWindow):
             if self._hdr_enabled:
                 self._player.target_prim = "bt.2020"
                 self._player.target_trc = "pq"
+                self._player.target_peak = self._nits
             else:
                 self._player.target_prim = "auto"
                 self._player.target_trc = "auto"
+                self._player.target_peak = "auto"
             self._schedule_color_log.emit()
         except Exception as e:
             print(f"[HDR] Apply error: {e}")
@@ -770,7 +814,7 @@ class MainWindow(QMainWindow):
         parts = []
         for name in ("current_vo", "target_colorspace_hint",
                       "target_colorspace_hint_mode", "target_prim",
-                      "target_trc", "gamut_mapping_mode",
+                      "target_trc", "target_peak", "gamut_mapping_mode",
                       "colormatrix", "colorlevels",
                       "hwdec_current"):
             try:
@@ -889,7 +933,7 @@ class MainWindow(QMainWindow):
             global seek_base_pos
             # Step 1: Try yt-dlp
             _video_url, audio_url, title, duration, is_live, _video_headers = resolve_media_url(uri)
-            
+
             # Step 2: If yt-dlp failed, scrape the page HTML directly
             if audio_url is None:
                 print(f"[PLAY] yt-dlp failed, scraping page HTML...")
@@ -897,7 +941,7 @@ class MainWindow(QMainWindow):
                 if scraped:
                     audio_url = scraped
                     print(f"[PLAY] Scrape found: {audio_url[:120]}")
-            
+
             # Step 3: Fallback to raw URI
             if audio_url is None:
                 audio_url = uri

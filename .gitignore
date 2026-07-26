@@ -1,0 +1,7 @@
+.idea
+.venv
+__pycache__
+ffmpeg
+mpv-bin
+.env
+ytstreamer.py

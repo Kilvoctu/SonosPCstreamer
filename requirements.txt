@@ -1,0 +1,6 @@
+soco
+psutil
+python-dotenv
+python-mpv
+PyQt5
+yt-dlp

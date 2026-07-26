@@ -31,7 +31,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from PyQt5.QtCore import Qt, QTimer, QPoint, QRect, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-    QPushButton, QSlider, QSpinBox, QVBoxLayout, QWidget,
+    QPushButton, QComboBox, QSlider, QSpinBox, QVBoxLayout, QWidget,
 )
 
 load_dotenv()
@@ -44,6 +44,7 @@ sonos_playing = False
 ffmpeg_process = None
 ffmpeg_lock = threading.Lock()
 seek_base_pos = 0.0
+selected_audio_track = -1   # -1 = default (stream 0), 0+ = specific track index
 
 
 def get_local_ip():
@@ -102,6 +103,19 @@ def find_ffmpeg():
     ffmpeg_path = shutil.which("ffmpeg")
     if ffmpeg_path:
         return ffmpeg_path
+    return None
+
+
+def find_ffprobe():
+    bundled = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "ffmpeg", "ffmpeg-8.1-essentials_build", "bin", "ffprobe.exe",
+    )
+    if os.path.isfile(bundled):
+        return bundled
+    ffprobe_path = shutil.which("ffprobe")
+    if ffprobe_path:
+        return ffprobe_path
     return None
 
 
@@ -173,7 +187,7 @@ class StreamHandler(BaseHTTPRequestHandler):
         self.handle_stream(head_only=True)
 
     def handle_stream(self, head_only=False):
-        global ffmpeg_process
+        global ffmpeg_process, selected_audio_track
         if self.path != "/stream.mp3":
             self.send_error(404)
             return
@@ -194,6 +208,10 @@ class StreamHandler(BaseHTTPRequestHandler):
             cmd += ["-ss", str(audio_seek_offset), "-i", audio_uri]
         else:
             cmd += ["-i", audio_uri]
+        # Add explicit audio stream selection for local files
+        if selected_audio_track >= 0 and not audio_uri.startswith("http"):
+            cmd += ["-map", f"0:a:{selected_audio_track}"]
+            print(f"[STREAM] Mapping audio stream: 0:a:{selected_audio_track}")
         cmd += ["-vn", "-acodec", "libmp3lame", "-ab", "192k",
                 "-ac", "2", "-ar", "44100", "-f", "mp3", "pipe:1"]
         print(f"[STREAM] Starting ffmpeg: {audio_uri} (seek={audio_seek_offset}s)")
@@ -372,6 +390,152 @@ def scrape_page_for_media(url):
         return None
 
 
+def probe_audio_tracks(path_or_url):
+    """Probe a local file or URL for available audio tracks.
+
+    Returns a dict with probe results, or None on failure.
+    For local files: {"type": "local", "audio_tracks": [...]}
+    For URLs: {"type": "url", "video_url": ..., "title": ..., "duration": ...,
+               "is_live": ..., "video_headers": ..., "audio_tracks": [...]}
+    """
+    parsed = urlparse(path_or_url)
+    is_url = parsed.scheme in ("http", "https", "ftp", "udp", "rtmp", "rtsp")
+    if is_url:
+        return _probe_url_audio_tracks(path_or_url)
+    else:
+        return _probe_local_audio_tracks(path_or_url)
+
+
+def _probe_local_audio_tracks(file_path):
+    if not os.path.isfile(file_path):
+        return None
+    ffprobe_path = find_ffprobe()
+    if not ffprobe_path:
+        return None
+    try:
+        cmd = [ffprobe_path, "-v", "quiet", "-print_format", "json",
+               "-show_streams", "-select_streams", "a", file_path]
+        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL,
+                                      creationflags=CREATE_NO_WINDOW)
+        data = json.loads(out)
+        streams = data.get("streams", [])
+        tracks = []
+        for s in streams:
+            idx = s.get("index", 0)
+            codec = s.get("codec_name", "unknown")
+            ch_layout = s.get("channel_layout", "")
+            tags = s.get("tags", {}) or {}
+            title = tags.get("title", "")
+            lang = tags.get("language", "")
+            # Build display name
+            display_parts = []
+            if title:
+                display_parts.append(title)
+            elif lang:
+                display_parts.append(lang.upper())
+            else:
+                display_parts.append(f"Stream {idx}")
+            codec_part = codec
+            if ch_layout:
+                codec_part += f", {ch_layout}"
+            display_parts.append(f"({codec_part})")
+            display = " ".join(display_parts)
+            tracks.append({
+                "index": idx,
+                "title": display,
+                "codec": codec,
+                "channels": ch_layout,
+                "language": lang,
+                "_raw_title": title,
+            })
+        return {"type": "local", "audio_tracks": tracks}
+    except Exception as e:
+        print(f"[PROBE] Local probe failed: {e}")
+        return None
+
+
+def _probe_url_audio_tracks(url):
+    try:
+        ydl_opts = {
+            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestaudio/best",
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "skip_download": True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if info is None:
+                return None
+
+            video_url = info.get("url")
+            title = info.get("title", "Unknown")
+            duration = info.get("duration", 0) or 0
+            is_live = info.get("is_live", False) or False
+
+            audio_tracks = []
+            formats = info.get("formats", [])
+
+            # Find video format for headers and fallback video_url
+            video_headers = {}
+            best_video = None
+            for fmt in formats:
+                if fmt.get("vcodec", "none") != "none" and fmt.get("height", 0):
+                    if best_video is None or (fmt.get("height", 0) or 0) > (best_video.get("height", 0) or 0):
+                        best_video = fmt
+            if best_video:
+                video_headers = best_video.get("http_headers", {})
+                if not video_url:
+                    video_url = best_video.get("url")
+
+            idx = 0
+            for fmt in formats:
+                acodec = fmt.get("acodec", "none")
+                vcodec = fmt.get("vcodec", "none")
+                if acodec != "none" and (vcodec == "none" or vcodec is None):
+                    ext = fmt.get("ext", "")
+                    abr = fmt.get("abr")
+                    format_note = fmt.get("format_note", "")
+                    fmt_url = fmt.get("url", "")
+                    if not fmt_url:
+                        continue
+                    # Build display name: "Format 140: m4a 128kbps (aac)"
+                    parts = [f"Format {fmt.get('format_id', idx)}:"]
+                    if ext:
+                        parts.append(ext)
+                    if abr:
+                        parts.append(f"{int(abr)}kbps")
+                    elif format_note:
+                        parts.append(format_note)
+                    if acodec and acodec != "none":
+                        parts.append(f"({acodec})")
+                    display = " ".join(parts)
+
+                    audio_tracks.append({
+                        "index": idx,
+                        "format_id": fmt.get("format_id", ""),
+                        "title": display,
+                        "codec": acodec,
+                        "channels": "",
+                        "language": fmt.get("language", ""),
+                        "url": fmt_url,
+                    })
+                    idx += 1
+
+            return {
+                "type": "url",
+                "video_url": video_url or "",
+                "title": title,
+                "duration": duration,
+                "is_live": is_live,
+                "video_headers": video_headers,
+                "audio_tracks": audio_tracks,
+            }
+    except Exception as e:
+        print(f"[PROBE] URL probe failed: {e}")
+        return None
+
+
 DARK_STYLE = """
 QMainWindow {
     background-color: #1a1a2e;
@@ -484,6 +648,41 @@ QSpinBox::up-button, QSpinBox::down-button {
 QSpinBox::up-button:hover, QSpinBox::down-button:hover {
     background-color: #1a4a7a;
 }
+QComboBox {
+    background-color: #0a0f1e;
+    color: #eee;
+    border: 1px solid #0f3460;
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-size: 12px;
+    min-height: 20px;
+}
+QComboBox:focus { border-color: #a0c4ff; }
+QComboBox:disabled {
+    background-color: #1a2540;
+    color: #555;
+    border-color: #1a2540;
+}
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 20px;
+    border-left: 1px solid #0f3460;
+    border-top-right-radius: 4px;
+    border-bottom-right-radius: 4px;
+}
+QComboBox::down-arrow {
+    width: 10px;
+    height: 10px;
+}
+QComboBox QAbstractItemView {
+    background-color: #0a0f1e;
+    color: #eee;
+    border: 1px solid #0f3460;
+    selection-background-color: #0f3460;
+    selection-color: #a0c4ff;
+    outline: none;
+}
 """
 
 
@@ -503,6 +702,7 @@ class MainWindow(QMainWindow):
     _status_signal = pyqtSignal(str)
     _schedule_color_log = pyqtSignal()
     _sonos_pos_signal = pyqtSignal(str, float)
+    _probe_signal = pyqtSignal(object)   # probe result dict
 
     def __init__(self):
         super().__init__()
@@ -527,6 +727,10 @@ class MainWindow(QMainWindow):
         self._current_speed = 1.0
         self._last_soco_elapsed = 0.0
         self._last_soco_time = 0.0
+        self._audio_tracks = []
+        self._probe_data = None
+        self._last_probed_uri = ""
+        self._selected_audio_index = -1
 
         central = QWidget()
         central.setObjectName("centralWidget")
@@ -612,6 +816,18 @@ class MainWindow(QMainWindow):
         transport_row.addStretch()
         content_layout.addLayout(transport_row)
 
+        audio_track_row = QHBoxLayout()
+        self.audio_track_label = QLabel("Audio Track:")
+        self.audio_track_label.setStyleSheet("color: #888; font-size: 12px;")
+        audio_track_row.addWidget(self.audio_track_label)
+        self.audio_track_combo = QComboBox()
+        self.audio_track_combo.setMinimumWidth(260)
+        self.audio_track_combo.addItem("Default (auto)", -1)
+        self.audio_track_combo.setEnabled(False)
+        self.audio_track_combo.currentIndexChanged.connect(self._on_audio_track_changed)
+        audio_track_row.addWidget(self.audio_track_combo, stretch=1)
+        content_layout.addLayout(audio_track_row)
+
         time_row = QHBoxLayout()
         self.time_label = QLabel("00:00 / 00:00")
         self.time_label.setStyleSheet("color: #888; font-size: 12px; min-width: 100px;")
@@ -652,6 +868,8 @@ class MainWindow(QMainWindow):
         self._status_signal.connect(self.status_label.setText)
         self._schedule_color_log.connect(self._on_schedule_color_log)
         self._sonos_pos_signal.connect(self._on_sonos_pos)
+        self._probe_signal.connect(self._on_probe_result)
+        self.uri_label.textChanged.connect(self._on_uri_changed)
 
         self._sonos_timer = QTimer(self)
         self._sonos_timer.timeout.connect(self._poll_sonos_position)
@@ -745,6 +963,70 @@ class MainWindow(QMainWindow):
             self.sonos_label.setText(f"Sonos: {fmt_time(int(audio_pos*1000))}")
         else:
             self.sonos_label.setText(f"Sonos: {pos_str}")
+
+    def _on_uri_changed(self, text):
+        if not text.strip():
+            return
+        try:
+            self._probe_timer.stop()
+        except (AttributeError, RuntimeError):
+            pass
+        if not hasattr(self, '_probe_timer'):
+            self._probe_timer = QTimer(self)
+            self._probe_timer.setSingleShot(True)
+            self._probe_timer.timeout.connect(lambda: self._schedule_probe(self.uri_label.text().strip()))
+        self._probe_timer.start(800)
+
+    def _schedule_probe(self, uri):
+        if not uri or uri == self._last_probed_uri:
+            return
+        self._last_probed_uri = uri
+        self.audio_track_combo.blockSignals(True)
+        self.audio_track_combo.clear()
+        self.audio_track_combo.addItem("Probing...", -2)
+        self.audio_track_combo.setEnabled(False)
+        self.audio_track_combo.blockSignals(False)
+        self._audio_tracks = []
+        self._probe_data = None
+        self._selected_audio_index = -1
+        threading.Thread(target=self._probe_worker, args=(uri,), daemon=True).start()
+
+    def _probe_worker(self, uri):
+        result = probe_audio_tracks(uri)
+        self._probe_signal.emit(result)
+
+    def _on_probe_result(self, result):
+        self.audio_track_combo.blockSignals(True)
+        self.audio_track_combo.clear()
+        if result is None:
+            self.audio_track_combo.addItem("Probe failed", -1)
+            self.audio_track_combo.setEnabled(False)
+            self._audio_tracks = []
+            self._probe_data = None
+        else:
+            tracks = result.get("audio_tracks", [])
+            self._probe_data = result
+            self._audio_tracks = tracks
+            if tracks:
+                for i, t in enumerate(tracks):
+                    display = t.get("title", f"Stream {t['index']}")
+                    self.audio_track_combo.addItem(display, i)
+                self.audio_track_combo.setEnabled(True)
+            else:
+                self.audio_track_combo.addItem("No audio tracks found", -1)
+                self.audio_track_combo.setEnabled(False)
+        self.audio_track_combo.setCurrentIndex(0)
+        self.audio_track_combo.blockSignals(False)
+
+    def _on_audio_track_changed(self, index):
+        idx = self.audio_track_combo.itemData(index)
+        self._selected_audio_index = idx if idx is not None else -1
+        global selected_audio_track
+        if self._probe_data and self._probe_data.get("type") == "local":
+            selected_audio_track = self._selected_audio_index
+        else:
+            selected_audio_track = -1
+        print(f"[AUDIO] Track selected: index={self._selected_audio_index}, global={selected_audio_track}")
 
     def _ensure_player(self):
         if self._player is not None:
@@ -876,6 +1158,7 @@ class MainWindow(QMainWindow):
                 self._player.seek(pos_sec, "absolute")
                 self._player.speed = 1.0
                 self._current_speed = 1.0
+                self._initial_sync_done = False
             except Exception as e:
                 print(f"[MPV] Seek error: {e}")
         if self._current_uri:
@@ -905,6 +1188,7 @@ class MainWindow(QMainWindow):
         )
         if path:
             self.uri_label.setText(path)
+            self._schedule_probe(path)
 
     def on_play(self):
         uri = self.uri_label.text().strip()
@@ -931,25 +1215,57 @@ class MainWindow(QMainWindow):
 
         def resolve_and_play():
             global seek_base_pos
-            # Step 1: Try yt-dlp
-            _video_url, audio_url, title, duration, is_live, _video_headers = resolve_media_url(uri)
 
-            # Step 2: If yt-dlp failed, scrape the page HTML directly
-            if audio_url is None:
-                print(f"[PLAY] yt-dlp failed, scraping page HTML...")
-                scraped = scrape_page_for_media(uri)
-                if scraped:
-                    audio_url = scraped
-                    print(f"[PLAY] Scrape found: {audio_url[:120]}")
+            # Check if we have cached probe data from pre-play probing
+            use_cache = (self._probe_data is not None
+                         and self._last_probed_uri == uri
+                         and self._probe_data.get("audio_tracks"))
 
-            # Step 3: Fallback to raw URI
-            if audio_url is None:
+            if use_cache and self._probe_data["type"] == "url":
+                # Use cached probe data (avoids redundant yt-dlp call)
+                data = self._probe_data
+                _video_url = data.get("video_url", uri)
+                title = data.get("title", uri)
+                duration = data.get("duration", 0) or 0
+                is_live = data.get("is_live", False) or False
+                # Select audio URL from chosen track
+                tracks = data.get("audio_tracks", [])
+                sel = self._selected_audio_index
+                if sel >= 0 and sel < len(tracks):
+                    audio_url = tracks[sel].get("url", uri)
+                elif tracks:
+                    audio_url = tracks[0].get("url", uri)
+                else:
+                    audio_url = uri
+                print(f"[PLAY] Using cached probe data: {title}")
+            elif use_cache and self._probe_data["type"] == "local":
+                # Local file: use raw URI; track index from selected_audio_track
+                _video_url = uri
                 audio_url = uri
-                title = title or uri
+                title = os.path.basename(uri)
+                duration = 0
                 is_live = False
-                print(f"[PLAY] Could not resolve media, using raw URI")
+                print(f"[PLAY] Local file with cached probe: {title}")
             else:
-                print(f"[PLAY] Final audio URL: {audio_url[:120]}...")
+                # No cache hit: fall through to current resolve logic
+                _video_url, audio_url, title, duration, is_live, _video_headers = resolve_media_url(uri)
+
+                # Step 2: If yt-dlp failed, scrape the page HTML directly
+                if audio_url is None:
+                    print(f"[PLAY] yt-dlp failed, scraping page HTML...")
+                    scraped = scrape_page_for_media(uri)
+                    if scraped:
+                        audio_url = scraped
+                        print(f"[PLAY] Scrape found: {audio_url[:120]}")
+
+                # Step 3: Fallback to raw URI
+                if audio_url is None:
+                    audio_url = uri
+                    title = title or uri
+                    is_live = False
+                    print(f"[PLAY] Could not resolve media, using raw URI")
+                else:
+                    print(f"[PLAY] Final audio URL: {audio_url[:120]}...")
 
             self._resolved_audio_url = audio_url
             self._is_live = is_live

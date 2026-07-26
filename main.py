@@ -7,6 +7,8 @@ import sys
 import threading
 import re
 import time
+from urllib.parse import urlparse, parse_qs, urljoin
+import urllib.request
 
 MPV_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mpv-bin")
 os.environ["PATH"] = MPV_DIR + os.pathsep + os.environ["PATH"]
@@ -258,20 +260,8 @@ def set_audio_stream(uri, seek_sec=0):
     print(f"[AUDIO] Stream offset set to {seek_sec}s")
 
 
-_YT_URL_RE = re.compile(
-    r'(?:https?://)?'
-    r'(?:www\.)?'
-    r'(?:youtube\.com/(?:watch\?.*?v=|live/|shorts/)|youtu\.be/)'
-    r'[\w-]+'
-)
-
-
-def is_youtube_url(url):
-    return bool(_YT_URL_RE.match(url.strip()))
-
-
-def resolve_youtube_url(url):
-    """Resolve a YouTube URL to direct video + audio CDN URLs.
+def resolve_media_url(url):
+    """Resolve a media URL to direct video + audio CDN URLs.
     
     Returns (video_url, audio_url, title, duration, is_live, video_headers) or
     (None, None, None, 0, False, {}) on failure.
@@ -287,7 +277,7 @@ def resolve_youtube_url(url):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             if info is None:
-                print("[YT] Failed to extract info")
+                print("[RESOLVE] Failed to extract info")
                 return None, None, None, 0, False, {}
             video_url = info.get("url")
             audio_url = info.get("url")
@@ -312,11 +302,74 @@ def resolve_youtube_url(url):
                     video_headers = best_video.get("http_headers", {})
                 else:
                     video_headers = {}
-            print(f"[YT] Resolved: {title} (live={is_live}, dur={duration}s)")
+            print(f"[RESOLVE] Resolved: {title} (live={is_live}, dur={duration}s)")
             return video_url, audio_url, title, duration, is_live, video_headers
     except Exception as e:
-        print(f"[YT] Resolution failed: {e}")
+        print(f"[RESOLVE] Resolution failed: {e}")
         return None, None, None, 0, False, {}
+
+
+
+
+def resolve_embed_url(url):
+    """Detect known streaming-site URL patterns and reconstruct their embed URL.
+    
+    Returns a single embed URL string, or None if not applicable.
+    """
+    try:
+        parsed = urlparse(url)
+        # Currently no supported embed patterns — sites are handled by
+        # scrape_page_for_media() which parses the actual HTML.
+        return None
+    except Exception:
+        return None
+
+
+def scrape_page_for_media(url):
+    """Fetch a page and extract a playable media URL from its HTML.
+    
+    Handles JS-rendered video players that yt-dlp cannot parse.
+    Returns a direct media URL string, an iframe embed URL for further
+    scraping, or None if nothing is found.
+    """
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+
+        # JS config patterns: "file":"..." or "src":"..."
+        file_urls = re.findall(r'"file"\s*:\s*"([^"]+)"', html)
+        src_urls = re.findall(r'"src"\s*:\s*"([^"]+)"', html)
+        video_src = re.findall(r'<video[^>]+src="([^"]+)"', html, re.IGNORECASE)
+        source_src = re.findall(r'<source[^>]+src="([^"]+)"', html, re.IGNORECASE)
+        iframes = re.findall(r'<iframe[^>]+src="([^"]+)"', html, re.IGNORECASE)
+
+        # Collect candidates in priority order
+        candidates = file_urls + src_urls + video_src + source_src + iframes
+
+        media_ext = re.compile(r'\.(m3u8|mp4|webm|ts)(\?|$)', re.IGNORECASE)
+
+        for c in candidates:
+            c = c.strip().strip('"\'')
+            absolute = urljoin(url, c)
+            if media_ext.search(absolute):
+                print(f"[SCRAPE] Found media URL: {absolute[:120]}")
+                return absolute
+
+        # No direct media URL; return first iframe for recursive scraping
+        if iframes:
+            iframe_url = urljoin(url, iframes[0].strip().strip('"\''))
+            print(f"[SCRAPE] Found iframe embed: {iframe_url}")
+            return iframe_url
+
+        print(f"[SCRAPE] No media found in {url[:80]}")
+        return None
+    except Exception as e:
+        print(f"[SCRAPE] Failed to fetch {url[:80]}: {e}")
+        return None
 
 
 DARK_STYLE = """
@@ -829,104 +882,78 @@ class MainWindow(QMainWindow):
         if not self._ensure_player():
             return
 
-        # Check if this is a YouTube URL
-        if is_youtube_url(uri):
-            self.status_label.setText("Resolving YouTube URL...")
-            print(f"[YT] Detected YouTube URL: {uri}")
+        self.status_label.setText("Resolving URL...")
+        print(f"[PLAY] Resolving: {uri}")
 
-            def resolve_and_play():
-                global seek_base_pos
-                _video_url, audio_url, title, duration, is_live, _video_headers = resolve_youtube_url(uri)
-                if audio_url is None:
-                    audio_url = uri
-                    title = title or uri
-                    is_live = False
-
-                print(f"[YT] Resolved: {title} (live={is_live}, dur={duration}s)")
-                print(f"[YT] audio_url: {audio_url[:120] if audio_url else 'None'}...")
-
-                self._resolved_audio_url = audio_url
-                self._is_live = is_live
-
-                if is_live:
-                    self._is_live = True
-                    self.seek_slider.setEnabled(False)
-                    self.time_label.setText("LIVE / --:--")
-                    print(f"[YT] Live stream detected: {title}")
-                else:
-                    self.seek_slider.setEnabled(True)
-
-                try:
-                    self._player.pause = True
-                    self._player.speed = 1.0
-                    self._current_speed = 1.0
-                    self._player.play(uri)
-                    print(f"[MPV] Playing YouTube via ytdl hook: {title}")
-                    self._schedule_color_log.emit()
-                except Exception as e:
-                    print(f"[MPV] Play error: {e}")
-                    self._status_signal.emit(f"Error: {e}")
-                    return
-
-                set_audio_stream(audio_url, seek_sec=0)
-                start_sonos_stream()
-                sonos_ok = wait_for_sonos_playing()
-
-                if is_live:
-                    self._status_signal.emit(f"Playing LIVE: {title}")
-                    if self._player:
-                        try:
-                            self._player.pause = False
-                        except Exception:
-                            pass
-                elif sonos_ok:
-                    seek_base_pos = 0.0
-                    self._sync_ready = True
-                    print(f"[SYNC] Initial: base=0, monitor will sync")
-                    self._status_signal.emit(f"Playing: {title}")
-                else:
-                    if self._player:
-                        try:
-                            self._player.pause = False
-                        except Exception:
-                            pass
-                    self._status_signal.emit(f"Playing (video only): {title}")
-
-            threading.Thread(target=resolve_and_play, daemon=True).start()
-            return
-
-        # Non-YouTube: play directly
-        try:
-            self._player.pause = True
-            self._player.speed = 1.0
-            self._current_speed = 1.0
-            self._player.play(uri)
-            print(f"[MPV] Playing: {uri}")
-            self._schedule_color_log.emit()
-        except Exception as e:
-            print(f"[MPV] Play error: {e}")
-            self.status_label.setText(f"Error: {e}")
-            return
-
-        def work():
+        def resolve_and_play():
             global seek_base_pos
-            set_audio_stream(uri, seek_sec=0)
+            # Step 1: Try yt-dlp
+            _video_url, audio_url, title, duration, is_live, _video_headers = resolve_media_url(uri)
+            
+            # Step 2: If yt-dlp failed, scrape the page HTML directly
+            if audio_url is None:
+                print(f"[PLAY] yt-dlp failed, scraping page HTML...")
+                scraped = scrape_page_for_media(uri)
+                if scraped:
+                    audio_url = scraped
+                    print(f"[PLAY] Scrape found: {audio_url[:120]}")
+            
+            # Step 3: Fallback to raw URI
+            if audio_url is None:
+                audio_url = uri
+                title = title or uri
+                is_live = False
+                print(f"[PLAY] Could not resolve media, using raw URI")
+            else:
+                print(f"[PLAY] Final audio URL: {audio_url[:120]}...")
+
+            self._resolved_audio_url = audio_url
+            self._is_live = is_live
+
+            if is_live:
+                self.seek_slider.setEnabled(False)
+                self.time_label.setText("LIVE / --:--")
+                print(f"[PLAY] Live stream detected: {title}")
+            else:
+                self.seek_slider.setEnabled(True)
+
+            try:
+                self._player.pause = True
+                self._player.speed = 1.0
+                self._current_speed = 1.0
+                self._player.play(_video_url or uri)
+                print(f"[MPV] Playing: {title}")
+                self._schedule_color_log.emit()
+            except Exception as e:
+                print(f"[MPV] Play error: {e}")
+                self._status_signal.emit(f"Error: {e}")
+                return
+
+            set_audio_stream(audio_url, seek_sec=0)
             start_sonos_stream()
             sonos_ok = wait_for_sonos_playing()
-            if sonos_ok:
+
+            if is_live:
+                self._status_signal.emit(f"Playing LIVE: {title}")
+                if self._player:
+                    try:
+                        self._player.pause = False
+                    except Exception:
+                        pass
+            elif sonos_ok:
                 seek_base_pos = 0.0
                 self._sync_ready = True
                 print(f"[SYNC] Initial: base=0, monitor will sync")
-                self._status_signal.emit("Playing")
+                self._status_signal.emit(f"Playing: {title}")
             else:
                 if self._player:
                     try:
                         self._player.pause = False
                     except Exception:
                         pass
-                self._status_signal.emit("Playing (video only)")
+                self._status_signal.emit(f"Playing (video only): {title}")
 
-        threading.Thread(target=work, daemon=True).start()
+        threading.Thread(target=resolve_and_play, daemon=True).start()
 
     def do_stop(self):
         global audio_uri, audio_seek_offset, ffmpeg_process, seek_base_pos

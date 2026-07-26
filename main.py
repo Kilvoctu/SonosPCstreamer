@@ -448,6 +448,7 @@ class MainWindow(QMainWindow):
         self._hdr_enabled = load_settings().get("hdr_enabled", False)
         self._sync_ready = False
         self._initial_sync_done = False
+        self._current_speed = 1.0
         self._last_soco_elapsed = 0.0
         self._last_soco_time = 0.0
 
@@ -524,13 +525,20 @@ class MainWindow(QMainWindow):
         transport_row.addStretch()
         content_layout.addLayout(transport_row)
 
-        seek_row = QHBoxLayout()
+        time_row = QHBoxLayout()
         self.time_label = QLabel("00:00 / 00:00")
         self.time_label.setStyleSheet("color: #888; font-size: 12px; min-width: 100px;")
-        seek_row.addWidget(self.time_label)
+        time_row.addWidget(self.time_label)
         self.sonos_label = QLabel("")
         self.sonos_label.setStyleSheet("color: #888; font-size: 11px; min-width: 120px;")
-        seek_row.addWidget(self.sonos_label)
+        time_row.addWidget(self.sonos_label)
+        time_row.addStretch()
+        self.speed_label = QLabel("")
+        self.speed_label.setStyleSheet("color: #aaa; font-size: 12px; min-width: 60px;")
+        time_row.addWidget(self.speed_label)
+        content_layout.addLayout(time_row)
+
+        seek_row = QHBoxLayout()
         self.seek_slider = QSlider(Qt.Horizontal)
         self.seek_slider.setRange(0, 1000)
         self.seek_slider.sliderPressed.connect(self._on_seek_pressed)
@@ -588,6 +596,11 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(1000, self._on_schedule_color_log)
 
     def _poll_sonos_position(self):
+        spd = self._current_speed
+        if spd != 1.0:
+            self.speed_label.setText(f"{spd:.3f}x")
+        else:
+            self.speed_label.setText("")
         if not self._sync_ready or self._seeking or getattr(self, '_sonos_busy', False):
             return
         self._sonos_busy = True
@@ -618,12 +631,23 @@ class MainWindow(QMainWindow):
                 return
             drift = video_pos - audio_pos
 
-            if not self._initial_sync_done or abs(drift) > 0.5:
+            if not self._initial_sync_done:
                 self._player.pause = True
                 self._player.seek(audio_pos, "absolute")
                 self._player.pause = False
-                print(f"[SYNC] {'Init' if not self._initial_sync_done else 'Drift'} sync: drift={drift:.1f}s → {audio_pos:.1f}s")
+                self._player.speed = 1.0
+                self._current_speed = 1.0
+                print(f"[SYNC] Init sync: drift={drift:.1f}s → {audio_pos:.1f}s")
                 self._initial_sync_done = True
+            elif abs(drift) > 0.5:
+                spd = 1.0 - drift / 3.0
+                spd = max(0.5, min(2.0, spd))
+                self._player.speed = spd
+                self._current_speed = spd
+                print(f"[SYNC] Speed: drift={drift:.1f}s → {spd:.3f}x")
+            elif self._current_speed != 1.0:
+                self._player.speed = 1.0
+                self._current_speed = 1.0
         except Exception:
             pass
         finally:
@@ -753,6 +777,8 @@ class MainWindow(QMainWindow):
             try:
                 self._player.pause = True
                 self._player.seek(pos_sec, "absolute")
+                self._player.speed = 1.0
+                self._current_speed = 1.0
             except Exception as e:
                 print(f"[MPV] Seek error: {e}")
         if self._current_uri:
@@ -832,6 +858,8 @@ class MainWindow(QMainWindow):
 
                 try:
                     self._player.pause = True
+                    self._player.speed = 1.0
+                    self._current_speed = 1.0
                     self._player.play(uri)
                     print(f"[MPV] Playing YouTube via ytdl hook: {title}")
                     self._schedule_color_log.emit()
@@ -870,6 +898,8 @@ class MainWindow(QMainWindow):
         # Non-YouTube: play directly
         try:
             self._player.pause = True
+            self._player.speed = 1.0
+            self._current_speed = 1.0
             self._player.play(uri)
             print(f"[MPV] Playing: {uri}")
             self._schedule_color_log.emit()
@@ -901,6 +931,7 @@ class MainWindow(QMainWindow):
     def do_stop(self):
         global audio_uri, audio_seek_offset, ffmpeg_process, seek_base_pos
         seek_base_pos = 0.0
+        self._current_speed = 1.0
         self._sync_ready = False
         self._initial_sync_done = False
         self._last_soco_elapsed = 0.0

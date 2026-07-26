@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import socket
@@ -10,6 +11,12 @@ import time
 MPV_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mpv-bin")
 os.environ["PATH"] = MPV_DIR + os.pathsep + os.environ["PATH"]
 
+# Add venv Scripts to PATH for yt-dlp CLI access
+_vdir = os.path.dirname(os.path.abspath(__file__))
+_venv_scripts = os.path.join(_vdir, ".venv", "Scripts")
+if os.path.isdir(_venv_scripts) and _venv_scripts not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = _venv_scripts + os.pathsep + os.environ["PATH"]
+
 if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
     os.add_dll_directory(MPV_DIR)
 
@@ -19,7 +26,7 @@ import soco
 import yt_dlp
 from dotenv import load_dotenv
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from PyQt5.QtCore import Qt, QTimer, QPoint, QRect
+from PyQt5.QtCore import Qt, QTimer, QPoint, QRect, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QPushButton, QSlider, QVBoxLayout, QWidget,
@@ -34,6 +41,7 @@ audio_seek_offset = 0
 sonos_playing = False
 ffmpeg_process = None
 ffmpeg_lock = threading.Lock()
+seek_base_pos = 0.0
 
 
 def get_local_ip():
@@ -117,9 +125,42 @@ def wait_for_sonos_playing(timeout=60.0):
                 return True
         except Exception:
             pass
-        time.sleep(0.01)
+        time.sleep(0.5)
     print("[SYNC] Sonos did not start playing in time")
     return False
+
+
+_settings_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+
+def load_settings():
+    try:
+        with open(_settings_file) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_settings(data):
+    try:
+        with open(_settings_file, 'w') as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"[SETTINGS] Failed to save: {e}")
+
+
+def parse_sonos_position(pos_str):
+    if not pos_str or pos_str == 'NOT_IMPLEMENTED':
+        return 0.0
+    try:
+        parts = list(map(int, pos_str.split(':')))
+        if len(parts) == 3:
+            return float(parts[0] * 3600 + parts[1] * 60 + parts[2])
+        if len(parts) == 2:
+            return float(parts[0] * 60 + parts[1])
+        if len(parts) == 1:
+            return float(parts[0])
+    except Exception:
+        pass
+    return 0.0
 
 
 class StreamHandler(BaseHTTPRequestHandler):
@@ -232,8 +273,8 @@ def is_youtube_url(url):
 def resolve_youtube_url(url):
     """Resolve a YouTube URL to direct video + audio CDN URLs.
     
-    Returns (video_url, audio_url, title, duration, is_live) or
-    (None, None, None, 0, False) on failure.
+    Returns (video_url, audio_url, title, duration, is_live, video_headers) or
+    (None, None, None, 0, False, {}) on failure.
     """
     try:
         ydl_opts = {
@@ -247,12 +288,13 @@ def resolve_youtube_url(url):
             info = ydl.extract_info(url, download=False)
             if info is None:
                 print("[YT] Failed to extract info")
-                return None, None, None, 0, False
+                return None, None, None, 0, False, {}
             video_url = info.get("url")
             audio_url = info.get("url")
             title = info.get("title", "Unknown")
             duration = info.get("duration", 0) or 0
             is_live = info.get("is_live", False) or False
+            video_headers = {}
             if "formats" in info:
                 best_audio = None
                 for fmt in info["formats"]:
@@ -267,11 +309,14 @@ def resolve_youtube_url(url):
                             best_video = fmt
                 if best_video:
                     video_url = best_video.get("url", video_url)
+                    video_headers = best_video.get("http_headers", {})
+                else:
+                    video_headers = {}
             print(f"[YT] Resolved: {title} (live={is_live}, dur={duration}s)")
-            return video_url, audio_url, title, duration, is_live
+            return video_url, audio_url, title, duration, is_live, video_headers
     except Exception as e:
         print(f"[YT] Resolution failed: {e}")
-        return None, None, None, 0, False
+        return None, None, None, 0, False, {}
 
 
 DARK_STYLE = """
@@ -351,6 +396,19 @@ QPushButton#closeBtn {
     font-weight: bold;
 }
 QPushButton#closeBtn:hover { background-color: #4a1020; }
+QPushButton#hdrBtn {
+    background-color: #16213e;
+    color: #a0c4ff;
+    border: 1px solid #0f3460;
+    border-radius: 6px;
+    padding: 8px 14px;
+    font-size: 12px;
+}
+QPushButton#hdrBtn:checked {
+    background-color: #1a3a1a;
+    color: #6aff6a;
+    border: 1px solid #2a5a2a;
+}
 """
 
 
@@ -367,6 +425,10 @@ def fmt_time(ms):
 
 
 class MainWindow(QMainWindow):
+    _status_signal = pyqtSignal(str)
+    _schedule_color_log = pyqtSignal()
+    _sonos_pos_signal = pyqtSignal(str, float)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Sonos PC Streamer")
@@ -383,6 +445,11 @@ class MainWindow(QMainWindow):
         self._resize_edge = None
         self._RESIZE_MARGIN = 6
         self._is_live = False
+        self._hdr_enabled = load_settings().get("hdr_enabled", False)
+        self._sync_ready = False
+        self._initial_sync_done = False
+        self._last_soco_elapsed = 0.0
+        self._last_soco_time = 0.0
 
         central = QWidget()
         central.setObjectName("centralWidget")
@@ -448,6 +515,12 @@ class MainWindow(QMainWindow):
         self.fs_btn.setObjectName("browseBtn")
         self.fs_btn.clicked.connect(self.on_fullscreen)
         transport_row.addWidget(self.fs_btn)
+        self.hdr_btn = QPushButton("HDR: ON" if self._hdr_enabled else "HDR: OFF")
+        self.hdr_btn.setCheckable(True)
+        self.hdr_btn.setChecked(self._hdr_enabled)
+        self.hdr_btn.setObjectName("hdrBtn")
+        self.hdr_btn.toggled.connect(self._toggle_hdr)
+        transport_row.addWidget(self.hdr_btn)
         transport_row.addStretch()
         content_layout.addLayout(transport_row)
 
@@ -455,6 +528,9 @@ class MainWindow(QMainWindow):
         self.time_label = QLabel("00:00 / 00:00")
         self.time_label.setStyleSheet("color: #888; font-size: 12px; min-width: 100px;")
         seek_row.addWidget(self.time_label)
+        self.sonos_label = QLabel("")
+        self.sonos_label.setStyleSheet("color: #888; font-size: 11px; min-width: 120px;")
+        seek_row.addWidget(self.sonos_label)
         self.seek_slider = QSlider(Qt.Horizontal)
         self.seek_slider.setRange(0, 1000)
         self.seek_slider.sliderPressed.connect(self._on_seek_pressed)
@@ -478,6 +554,13 @@ class MainWindow(QMainWindow):
         self.status_label.setAlignment(Qt.AlignCenter)
         self.status_label.setStyleSheet("color: #555; font-size: 12px; margin-top: 4px;")
         content_layout.addWidget(self.status_label)
+        self._status_signal.connect(self.status_label.setText)
+        self._schedule_color_log.connect(self._on_schedule_color_log)
+        self._sonos_pos_signal.connect(self._on_sonos_pos)
+
+        self._sonos_timer = QTimer(self)
+        self._sonos_timer.timeout.connect(self._poll_sonos_position)
+        self._sonos_timer.start(250)
 
         try:
             self.vol_slider.setValue(speaker.volume)
@@ -491,6 +574,67 @@ class MainWindow(QMainWindow):
         self._poll_timer.timeout.connect(self._poll_position)
         self._poll_timer.start(500)
 
+    def _on_schedule_color_log(self):
+        # Poll until video is actually loaded before logging color state
+        if not self._player:
+            return
+        try:
+            vo = self._player.current_vo
+            if vo is not None:
+                self._log_color_info()
+                return
+        except Exception:
+            pass
+        QTimer.singleShot(1000, self._on_schedule_color_log)
+
+    def _poll_sonos_position(self):
+        if not self._sync_ready or self._seeking or getattr(self, '_sonos_busy', False):
+            return
+        self._sonos_busy = True
+        threading.Thread(target=self._fetch_sonos_pos, daemon=True).start()
+
+    def _fetch_sonos_pos(self):
+        global seek_base_pos
+        try:
+            info = speaker.get_current_track_info()
+            pos_str = info.get('position', '')
+            if not pos_str or pos_str == 'NOT_IMPLEMENTED':
+                return
+            elapsed = parse_sonos_position(pos_str)
+            if elapsed <= 0:
+                return
+            if elapsed != self._last_soco_elapsed:
+                self._last_soco_elapsed = elapsed
+                self._last_soco_time = time.time()
+            time_since = time.time() - self._last_soco_time
+            estimated_elapsed = self._last_soco_elapsed + time_since
+            audio_pos = seek_base_pos + estimated_elapsed
+            self._sonos_pos_signal.emit(pos_str, audio_pos)
+
+            if not self._player:
+                return
+            video_pos = self._player.time_pos
+            if video_pos is None:
+                return
+            drift = video_pos - audio_pos
+
+            if not self._initial_sync_done or abs(drift) > 0.5:
+                self._player.pause = True
+                self._player.seek(audio_pos, "absolute")
+                self._player.pause = False
+                print(f"[SYNC] {'Init' if not self._initial_sync_done else 'Drift'} sync: drift={drift:.1f}s → {audio_pos:.1f}s")
+                self._initial_sync_done = True
+        except Exception:
+            pass
+        finally:
+            self._sonos_busy = False
+
+    def _on_sonos_pos(self, pos_str, audio_pos):
+        if audio_pos > 0:
+            self.sonos_label.setText(f"Sonos: {fmt_time(int(audio_pos*1000))}")
+        else:
+            self.sonos_label.setText(f"Sonos: {pos_str}")
+
     def _ensure_player(self):
         if self._player is not None:
             return True
@@ -502,29 +646,62 @@ class MainWindow(QMainWindow):
                 pause=True,
                 vo="gpu-next",
                 gpu_api="d3d11",
+                ytdl=True,
+                ytdl_format="bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestaudio/best",
             )
             self._player.ao = "null"
-            # Set color management properties after init
-            self._player.video_output_levels = "full"
-            self._player.hdr_compute_peak = "no"
-            self._player.target_colorspace_hint = "auto"
-            self._player.target_colorspace_hint_mode = "source"
-            # Diagnostic: print what VO is active and color state
-            try:
-                vo = self._player.current_vo
-                levels = self._player.video_output_levels
-                peak = self._player.hdr_compute_peak
-                hint = self._player.target_colorspace_hint
-                csp = self._player.colorspace
-                print(f"[MPV] VO={vo} levels={levels} hdr_peak={peak} colorspace_hint={hint} colorspace={csp}")
-            except Exception as e:
-                print(f"[MPV] Diagnostics unavailable: {e}")
+            if self._hdr_enabled:
+                self._player.target_prim = "bt.2020"
+                self._player.target_trc = "pq"
+                print("[MPV] HDR target: bt.2020/pq")
+            else:
+                print("[MPV] HDR target: default (SDR)")
+            self._player.target_colorspace_hint = "yes"
+            self._player.target_colorspace_hint_mode = "target"
             print("[MPV] Player created via libmpv")
             return True
         except Exception as e:
             print(f"[MPV] Failed to create player: {e}")
             self.status_label.setText(f"mpv error: {e}")
             return False
+
+    def _toggle_hdr(self, checked):
+        self._hdr_enabled = checked
+        self.hdr_btn.setText("HDR: ON" if checked else "HDR: OFF")
+        save_settings({"hdr_enabled": checked})
+        self._apply_hdr_settings()
+        print(f"[HDR] Toggle: {'ON' if checked else 'OFF'}")
+
+    def _apply_hdr_settings(self):
+        if not self._player:
+            return
+        try:
+            if self._hdr_enabled:
+                self._player.target_prim = "bt.2020"
+                self._player.target_trc = "pq"
+            else:
+                self._player.target_prim = "auto"
+                self._player.target_trc = "auto"
+            self._schedule_color_log.emit()
+        except Exception as e:
+            print(f"[HDR] Apply error: {e}")
+
+    def _log_color_info(self):
+        """Log actual color state after content is loaded."""
+        if not self._player:
+            return
+        parts = []
+        for name in ("current_vo", "target_colorspace_hint",
+                      "target_colorspace_hint_mode", "target_prim",
+                      "target_trc", "gamut_mapping_mode",
+                      "colormatrix", "colorlevels",
+                      "hwdec_current"):
+            try:
+                val = getattr(self._player, name)
+                parts.append(f"{name}={val}")
+            except Exception:
+                parts.append(f"{name}=n/a")
+        print(f"[COLOR] {' '.join(parts)}")
 
     def get_position(self):
         if not self._player:
@@ -568,6 +745,7 @@ class MainWindow(QMainWindow):
         self._do_seek(pos_ms)
 
     def _do_seek(self, pos_ms):
+        global seek_base_pos
         if getattr(self, '_is_live', False):
             return
         pos_sec = pos_ms / 1000.0
@@ -579,16 +757,22 @@ class MainWindow(QMainWindow):
                 print(f"[MPV] Seek error: {e}")
         if self._current_uri:
             def work():
+                global seek_base_pos
                 uri = getattr(self, '_resolved_audio_url', None) or self._current_uri
                 set_audio_stream(uri, seek_sec=pos_sec)
                 start_sonos_stream()
-                wait_for_sonos_playing()
-                if self._player:
-                    try:
-                        self._player.pause = False
-                    except Exception:
-                        pass
-                print("[SYNC] Unpaused after seek")
+                sonos_ok = wait_for_sonos_playing()
+                if sonos_ok:
+                    seek_base_pos = pos_sec
+                    self._sync_ready = True
+                    print(f"[SYNC] Seek: base={pos_sec:.1f}s, monitor will sync")
+                else:
+                    if self._player:
+                        try:
+                            self._player.pause = False
+                        except Exception:
+                            pass
+                    self._status_signal.emit("Playing (video only)")
             threading.Thread(target=work, daemon=True).start()
 
     def browse_file(self):
@@ -606,11 +790,11 @@ class MainWindow(QMainWindow):
         self.do_play_uri(uri)
 
     def do_play_uri(self, uri):
-        global audio_uri, audio_seek_offset, sonos_playing
+        global audio_uri, audio_seek_offset, sonos_playing, seek_base_pos
+        self.do_stop()
         self._current_uri = uri
         self._is_live = False
         self._resolved_audio_url = None
-        self._resolved_video_url = None
         audio_uri = uri
         audio_seek_offset = 0
         sonos_playing = False
@@ -625,14 +809,16 @@ class MainWindow(QMainWindow):
             print(f"[YT] Detected YouTube URL: {uri}")
 
             def resolve_and_play():
-                video_url, audio_url, title, duration, is_live = resolve_youtube_url(uri)
-                if video_url is None:
-                    print("[YT] Resolution failed, falling back to original URL")
-                    video_url = uri
+                global seek_base_pos
+                _video_url, audio_url, title, duration, is_live, _video_headers = resolve_youtube_url(uri)
+                if audio_url is None:
                     audio_url = uri
+                    title = title or uri
                     is_live = False
 
-                self._resolved_video_url = video_url
+                print(f"[YT] Resolved: {title} (live={is_live}, dur={duration}s)")
+                print(f"[YT] audio_url: {audio_url[:120] if audio_url else 'None'}...")
+
                 self._resolved_audio_url = audio_url
                 self._is_live = is_live
 
@@ -646,30 +832,37 @@ class MainWindow(QMainWindow):
 
                 try:
                     self._player.pause = True
-                    self._player.play(video_url)
-                    print(f"[MPV] Playing resolved video: {title}")
+                    self._player.play(uri)
+                    print(f"[MPV] Playing YouTube via ytdl hook: {title}")
+                    self._schedule_color_log.emit()
                 except Exception as e:
                     print(f"[MPV] Play error: {e}")
-                    QTimer.singleShot(0, lambda: self.status_label.setText(f"Error: {e}"))
+                    self._status_signal.emit(f"Error: {e}")
                     return
 
                 set_audio_stream(audio_url, seek_sec=0)
                 start_sonos_stream()
                 sonos_ok = wait_for_sonos_playing()
 
-                if self._player:
-                    try:
-                        self._player.pause = False
-                    except Exception:
-                        pass
-                print("[SYNC] Unpaused video")
-
                 if is_live:
-                    QTimer.singleShot(0, lambda: self.status_label.setText(f"Playing LIVE: {title}"))
+                    self._status_signal.emit(f"Playing LIVE: {title}")
+                    if self._player:
+                        try:
+                            self._player.pause = False
+                        except Exception:
+                            pass
                 elif sonos_ok:
-                    QTimer.singleShot(0, lambda: self.status_label.setText(f"Playing: {title}"))
+                    seek_base_pos = 0.0
+                    self._sync_ready = True
+                    print(f"[SYNC] Initial: base=0, monitor will sync")
+                    self._status_signal.emit(f"Playing: {title}")
                 else:
-                    QTimer.singleShot(0, lambda: self.status_label.setText(f"Playing (video only): {title}"))
+                    if self._player:
+                        try:
+                            self._player.pause = False
+                        except Exception:
+                            pass
+                    self._status_signal.emit(f"Playing (video only): {title}")
 
             threading.Thread(target=resolve_and_play, daemon=True).start()
             return
@@ -679,36 +872,44 @@ class MainWindow(QMainWindow):
             self._player.pause = True
             self._player.play(uri)
             print(f"[MPV] Playing: {uri}")
+            self._schedule_color_log.emit()
         except Exception as e:
             print(f"[MPV] Play error: {e}")
             self.status_label.setText(f"Error: {e}")
             return
 
         def work():
+            global seek_base_pos
             set_audio_stream(uri, seek_sec=0)
             start_sonos_stream()
             sonos_ok = wait_for_sonos_playing()
-            if self._player:
-                try:
-                    self._player.pause = False
-                except Exception:
-                    pass
-            print("[SYNC] Unpaused video")
             if sonos_ok:
-                QTimer.singleShot(0, lambda: self.status_label.setText("Playing"))
+                seek_base_pos = 0.0
+                self._sync_ready = True
+                print(f"[SYNC] Initial: base=0, monitor will sync")
+                self._status_signal.emit("Playing")
             else:
-                QTimer.singleShot(0, lambda: self.status_label.setText("Playing (video only)"))
+                if self._player:
+                    try:
+                        self._player.pause = False
+                    except Exception:
+                        pass
+                self._status_signal.emit("Playing (video only)")
 
         threading.Thread(target=work, daemon=True).start()
 
     def do_stop(self):
-        global audio_uri, audio_seek_offset, ffmpeg_process
+        global audio_uri, audio_seek_offset, ffmpeg_process, seek_base_pos
+        seek_base_pos = 0.0
+        self._sync_ready = False
+        self._initial_sync_done = False
+        self._last_soco_elapsed = 0.0
+        self._last_soco_time = 0.0
         audio_uri = None
         audio_seek_offset = 0
         self._current_uri = None
         self._is_live = False
         self._resolved_audio_url = None
-        self._resolved_video_url = None
         self.seek_slider.setEnabled(True)
         with ffmpeg_lock:
             if ffmpeg_process:

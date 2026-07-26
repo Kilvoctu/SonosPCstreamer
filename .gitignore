@@ -5,3 +5,4 @@ ffmpeg
 mpv-bin
 .env
 ytstreamer.py
+settings.json

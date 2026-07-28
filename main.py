@@ -204,17 +204,16 @@ class StreamHandler(BaseHTTPRequestHandler):
             return
 
         cmd = [FFMPEG_PATH, "-re"]
+        cmd += ["-i", audio_uri]
         if audio_seek_offset > 0:
-            cmd += ["-ss", str(audio_seek_offset), "-i", audio_uri]
-        else:
-            cmd += ["-i", audio_uri]
+            cmd += ["-ss", str(audio_seek_offset)]
         # Add explicit audio stream selection for local files
         if selected_audio_track >= 0 and not audio_uri.startswith("http"):
             cmd += ["-map", f"0:a:{selected_audio_track}"]
             print(f"[STREAM] Mapping audio stream: 0:a:{selected_audio_track}")
         cmd += ["-vn", "-acodec", "libmp3lame", "-ab", "192k",
                 "-ac", "2", "-ar", "44100", "-f", "mp3", "pipe:1"]
-        print(f"[STREAM] Starting ffmpeg: {audio_uri} (seek={audio_seek_offset}s)")
+        print(f"[STREAM] Starting ffmpeg: {audio_uri} (seek_offset={audio_seek_offset}s)")
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -406,6 +405,14 @@ def probe_audio_tracks(path_or_url):
         return _probe_local_audio_tracks(path_or_url)
 
 
+def _is_hdr_transfer(color_transfer):
+    """Check if a color_transfer value indicates HDR content."""
+    if not color_transfer:
+        return False
+    ct = color_transfer.lower()
+    return ct in ("smpte2084", "arib-std-b67", "smpte428")
+
+
 def _probe_local_audio_tracks(file_path):
     if not os.path.isfile(file_path):
         return None
@@ -448,7 +455,22 @@ def _probe_local_audio_tracks(file_path):
                 "language": lang,
                 "_raw_title": title,
             })
-        return {"type": "local", "audio_tracks": tracks}
+        # Probe video stream for HDR detection
+        source_hdr = False
+        try:
+            vcmd = [ffprobe_path, "-v", "quiet", "-print_format", "json",
+                    "-show_streams", "-select_streams", "v", file_path]
+            vout = subprocess.check_output(vcmd, text=True, stderr=subprocess.DEVNULL,
+                                           creationflags=CREATE_NO_WINDOW)
+            vdata = json.loads(vout)
+            for vs in vdata.get("streams", []):
+                ct = vs.get("color_transfer", "") or ""
+                if _is_hdr_transfer(ct):
+                    source_hdr = True
+                    break
+        except Exception:
+            pass
+        return {"type": "local", "audio_tracks": tracks, "is_hdr": source_hdr}
     except Exception as e:
         print(f"[PROBE] Local probe failed: {e}")
         return None
@@ -478,6 +500,7 @@ def _probe_url_audio_tracks(url):
 
             # Find video format for headers and fallback video_url
             video_headers = {}
+            source_hdr = False
             best_video = None
             for fmt in formats:
                 if fmt.get("vcodec", "none") != "none" and fmt.get("height", 0):
@@ -487,6 +510,7 @@ def _probe_url_audio_tracks(url):
                 video_headers = best_video.get("http_headers", {})
                 if not video_url:
                     video_url = best_video.get("url")
+                source_hdr = _is_hdr_transfer(best_video.get("color_transfer", ""))
 
             idx = 0
             for fmt in formats:
@@ -530,6 +554,7 @@ def _probe_url_audio_tracks(url):
                 "is_live": is_live,
                 "video_headers": video_headers,
                 "audio_tracks": audio_tracks,
+                "is_hdr": source_hdr,
             }
     except Exception as e:
         print(f"[PROBE] URL probe failed: {e}")
@@ -735,6 +760,7 @@ class MainWindow(QMainWindow):
         self._RESIZE_MARGIN = 6
         self._is_live = False
         self._hdr_enabled = load_settings().get("hdr_enabled", False)
+        self._source_is_hdr = False
         self._nits = load_settings().get("nits", 1000)
         self._sync_ready = False
         self._initial_sync_done = False
@@ -1152,15 +1178,21 @@ class MainWindow(QMainWindow):
                 ytdl_format="bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestaudio/best",
             )
             self._player.ao = "null"
-            if self._hdr_enabled:
+            if self._hdr_enabled and self._source_is_hdr:
                 self._player.target_prim = "bt.2020"
                 self._player.target_trc = "pq"
                 self._player.target_peak = self._nits
-                print(f"[MPV] HDR target: bt.2020/pq, {self._nits}nits")
+                self._player.gamut_mapping_mode = "clip"
+                self._player.target_colorspace_hint = "yes"
+                self._player.target_colorspace_hint_mode = "target"
+                print(f"[MPV] HDR target: bt.2020/pq, {self._nits}nits (source is HDR)")
             else:
-                print("[MPV] HDR target: default (SDR)")
-            self._player.target_colorspace_hint = "yes"
-            self._player.target_colorspace_hint_mode = "target"
+                self._player.gamut_mapping_mode = "auto"
+                self._player.target_colorspace_hint = "no"
+                if self._hdr_enabled:
+                    print("[MPV] HDR enabled but source is SDR — using SDR output")
+                else:
+                    print("[MPV] HDR target: default (SDR)")
             print("[MPV] Player created via libmpv")
             return True
         except Exception as e:
@@ -1186,15 +1218,19 @@ class MainWindow(QMainWindow):
         if not self._player:
             return
         try:
-            if self._hdr_enabled:
+            if self._hdr_enabled and self._source_is_hdr:
                 self._player.target_prim = "bt.2020"
                 self._player.target_trc = "pq"
                 self._player.target_peak = self._nits
+                self._player.gamut_mapping_mode = "clip"
+                self._player.target_colorspace_hint = "yes"
+                self._player.target_colorspace_hint_mode = "target"
             else:
                 self._player.target_prim = "auto"
                 self._player.target_trc = "auto"
                 self._player.target_peak = "auto"
-            self._schedule_color_log.emit()
+                self._player.gamut_mapping_mode = "auto"
+                self._player.target_colorspace_hint = "no"
         except Exception as e:
             print(f"[HDR] Apply error: {e}")
 
@@ -1213,6 +1249,7 @@ class MainWindow(QMainWindow):
                 parts.append(f"{name}={val}")
             except Exception:
                 parts.append(f"{name}=n/a")
+        parts.append(f"source_hdr={getattr(self, '_source_is_hdr', None)}")
         print(f"[COLOR] {' '.join(parts)}")
 
     def get_position(self):
@@ -1274,8 +1311,12 @@ class MainWindow(QMainWindow):
         if self._current_uri:
             def work():
                 global seek_base_pos
-                uri = getattr(self, '_resolved_audio_url', None) or self._current_uri
-                set_audio_stream(uri, seek_sec=pos_sec)
+                audio = self._resolved_audio_url
+                if not audio:
+                    print("[SEEK] WARNING: No resolved audio URL available, seeking mpv only")
+                    self._sync_ready = True
+                    return
+                set_audio_stream(audio, seek_sec=pos_sec)
                 start_sonos_stream()
                 sonos_ok = wait_for_sonos_playing()
                 if sonos_ok:
@@ -1380,6 +1421,13 @@ class MainWindow(QMainWindow):
             self._resolved_audio_url = audio_url
             self._is_live = is_live
 
+            # Detect source HDR and apply color settings
+            self._source_is_hdr = False
+            if self._probe_data:
+                self._source_is_hdr = self._probe_data.get("is_hdr", False)
+            print(f"[PLAY] Source HDR: {self._source_is_hdr}, HDR toggle: {self._hdr_enabled}")
+            self._apply_hdr_settings()
+
             if is_live:
                 self.seek_slider.setEnabled(False)
                 self.time_label.setText("LIVE / --:--")
@@ -1391,7 +1439,7 @@ class MainWindow(QMainWindow):
                 self._player.pause = True
                 self._player.speed = 1.0
                 self._current_speed = 1.0
-                self._player.play(_video_url or uri)
+                self._player.play(uri)
                 print(f"[MPV] Playing: {title}")
                 self._schedule_color_log.emit()
             except Exception as e:
@@ -1437,6 +1485,7 @@ class MainWindow(QMainWindow):
         audio_seek_offset = 0
         self._current_uri = None
         self._is_live = False
+        self._source_is_hdr = False
         self._resolved_audio_url = None
         self._subtitle_tracks = []
         self._sub_last_track_ids = ()

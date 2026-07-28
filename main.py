@@ -234,8 +234,9 @@ class StreamHandler(BaseHTTPRequestHandler):
                 if not chunk:
                     break
                 self.wfile.write(chunk)
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-            pass
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as e:
+            print(f"[STREAM] Connection lost: {type(e).__name__}: {e}")
         finally:
             proc.kill()
             with ffmpeg_lock:
@@ -974,6 +975,19 @@ class MainWindow(QMainWindow):
     def _fetch_sonos_pos(self):
         global seek_base_pos
         try:
+            # Check if Sonos is still playing — auto-restart if it dropped
+            try:
+                transport = speaker.get_current_transport_info()
+                transport_state = transport.get("current_transport_state", "")
+                if transport_state not in ("PLAYING", "TRANSITIONING"):
+                    if self._current_uri and self._player:
+                        print(f"[SYNC] Sonos stopped ({transport_state}), restarting stream...")
+                        start_sonos_stream()
+                        self._initial_sync_done = False
+                        return
+            except Exception:
+                pass
+
             info = speaker.get_current_track_info()
             pos_str = info.get('position', '')
             if not pos_str or pos_str == 'NOT_IMPLEMENTED':
@@ -1013,8 +1027,8 @@ class MainWindow(QMainWindow):
             elif self._current_speed != 1.0:
                 self._player.speed = 1.0
                 self._current_speed = 1.0
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[SYNC] Poll error: {e}")
         finally:
             self._sonos_busy = False
 

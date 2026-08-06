@@ -1,14 +1,15 @@
+import glob
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
 import sys
 import threading
-import re
 import time
-from urllib.parse import urlparse, parse_qs, urljoin
 import urllib.request
+from urllib.parse import urlparse, urljoin
 
 MPV_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mpv-bin")
 os.environ["PATH"] = MPV_DIR + os.pathsep + os.environ["PATH"]
@@ -28,7 +29,7 @@ import soco
 import yt_dlp
 from dotenv import load_dotenv
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from PyQt5.QtCore import Qt, QTimer, QPoint, QRect, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, QRect, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QPushButton, QComboBox, QSlider, QSpinBox, QVBoxLayout, QWidget,
@@ -94,12 +95,12 @@ free_port(stream_port)
 
 
 def find_ffmpeg():
-    bundled = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "ffmpeg", "ffmpeg-8.1-essentials_build", "bin", "ffmpeg.exe",
-    )
-    if os.path.isfile(bundled):
-        return bundled
+    ffmpeg_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ffmpeg")
+    if os.path.isdir(ffmpeg_root):
+        for build_dir in glob.glob(os.path.join(ffmpeg_root, "ffmpeg-*-essentials_build")):
+            candidate = os.path.join(build_dir, "bin", "ffmpeg.exe")
+            if os.path.isfile(candidate):
+                return candidate
     ffmpeg_path = shutil.which("ffmpeg")
     if ffmpeg_path:
         return ffmpeg_path
@@ -107,12 +108,12 @@ def find_ffmpeg():
 
 
 def find_ffprobe():
-    bundled = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "ffmpeg", "ffmpeg-8.1-essentials_build", "bin", "ffprobe.exe",
-    )
-    if os.path.isfile(bundled):
-        return bundled
+    ffmpeg_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ffmpeg")
+    if os.path.isdir(ffmpeg_root):
+        for build_dir in glob.glob(os.path.join(ffmpeg_root, "ffmpeg-*-essentials_build")):
+            candidate = os.path.join(build_dir, "bin", "ffprobe.exe")
+            if os.path.isfile(candidate):
+                return candidate
     ffprobe_path = shutil.which("ffprobe")
     if ffprobe_path:
         return ffprobe_path
@@ -207,7 +208,6 @@ class StreamHandler(BaseHTTPRequestHandler):
         cmd += ["-i", audio_uri]
         if audio_seek_offset > 0:
             cmd += ["-ss", str(audio_seek_offset)]
-        # Add explicit audio stream selection for local files
         if selected_audio_track >= 0 and not audio_uri.startswith("http"):
             cmd += ["-map", f"0:a:{selected_audio_track}"]
             print(f"[STREAM] Mapping audio stream: 0:a:{selected_audio_track}")
@@ -327,22 +327,6 @@ def resolve_media_url(url):
         return None, None, None, 0, False, {}
 
 
-
-
-def resolve_embed_url(url):
-    """Detect known streaming-site URL patterns and reconstruct their embed URL.
-
-    Returns a single embed URL string, or None if not applicable.
-    """
-    try:
-        parsed = urlparse(url)
-        # Currently no supported embed patterns — sites are handled by
-        # scrape_page_for_media() which parses the actual HTML.
-        return None
-    except Exception:
-        return None
-
-
 def scrape_page_for_media(url):
     """Fetch a page and extract a playable media URL from its HTML.
 
@@ -411,7 +395,23 @@ def _is_hdr_transfer(color_transfer):
     if not color_transfer:
         return False
     ct = color_transfer.lower()
-    return ct in ("smpte2084", "arib-std-b67", "smpte428")
+    return ct in ("smpte2084", "arib-std-b67", "smpte428", "pq", "hlg")
+
+
+def _format_is_hdr(fmt):
+    """Return True if a yt-dlp format entry indicates HDR video."""
+    if _is_hdr_transfer(fmt.get("color_transfer", "")):
+        return True
+    prim = (fmt.get("color_primaries") or "").lower()
+    if prim in ("bt2020", "bt2020-10", "bt2020-12"):
+        return True
+    dr = (fmt.get("dynamic_range") or "").lower()
+    if "hdr" in dr or "hlg" in dr or "pq" in dr:
+        return True
+    note = (fmt.get("format_note") or "").lower()
+    if "hdr" in note:
+        return True
+    return False
 
 
 def _probe_local_audio_tracks(file_path):
@@ -435,7 +435,6 @@ def _probe_local_audio_tracks(file_path):
             tags = s.get("tags", {}) or {}
             title = tags.get("title", "")
             lang = tags.get("language", "")
-            # Build display name
             display_parts = []
             if title:
                 display_parts.append(title)
@@ -456,7 +455,6 @@ def _probe_local_audio_tracks(file_path):
                 "language": lang,
                 "_raw_title": title,
             })
-        # Probe video stream for HDR detection
         source_hdr = False
         try:
             vcmd = [ffprobe_path, "-v", "quiet", "-print_format", "json",
@@ -499,19 +497,19 @@ def _probe_url_audio_tracks(url):
             audio_tracks = []
             formats = info.get("formats", [])
 
-            # Find video format for headers and fallback video_url
             video_headers = {}
             source_hdr = False
             best_video = None
             for fmt in formats:
                 if fmt.get("vcodec", "none") != "none" and fmt.get("height", 0):
+                    if _format_is_hdr(fmt):
+                        source_hdr = True
                     if best_video is None or (fmt.get("height", 0) or 0) > (best_video.get("height", 0) or 0):
                         best_video = fmt
             if best_video:
                 video_headers = best_video.get("http_headers", {})
                 if not video_url:
                     video_url = best_video.get("url")
-                source_hdr = _is_hdr_transfer(best_video.get("color_transfer", ""))
 
             idx = 0
             for fmt in formats:
@@ -524,7 +522,6 @@ def _probe_url_audio_tracks(url):
                     fmt_url = fmt.get("url", "")
                     if not fmt_url:
                         continue
-                    # Build display name: "Format 140: m4a 128kbps (aac)"
                     parts = [f"Format {fmt.get('format_id', idx)}:"]
                     if ext:
                         parts.append(ext)
@@ -742,7 +739,7 @@ class MainWindow(QMainWindow):
     _status_signal = pyqtSignal(str)
     _schedule_color_log = pyqtSignal()
     _sonos_pos_signal = pyqtSignal(str, float)
-    _probe_signal = pyqtSignal(object)   # probe result dict
+    _probe_signal = pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
@@ -937,8 +934,9 @@ class MainWindow(QMainWindow):
         self._sonos_timer.start(250)
 
         try:
-            self.vol_slider.setValue(speaker.volume)
-            self.vol_label.setText(f"Volume: {speaker.volume}")
+            vol = speaker.volume
+            self.vol_slider.setValue(vol)
+            self.vol_label.setText(f"Volume: {vol}")
         except Exception:
             pass
 
@@ -1177,11 +1175,59 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"[SUB] Error toggling visibility: {e}")
 
+    def _color_output_kwargs(self):
+        """Return mpv options for the current color/output configuration.
+
+        The HDR toggle describes the DISPLAY, not the source. The detected
+        source only decides how gamut/tone mapping is handled.
+        """
+        if not self._hdr_enabled:
+            return {
+                "target_prim": "auto",
+                "target_trc": "auto",
+                "target_peak": "auto",
+                "gamut_mapping_mode": "auto",
+                "target_colorspace_hint": "no",
+                "inverse_tone_mapping": "no",
+                "hdr_compute_peak": "auto",
+            }
+        kwargs = {
+            "target_prim": "bt.2020",
+            "target_trc": "pq",
+            "target_peak": self._nits,
+            "target_colorspace_hint": "yes",
+            "target_colorspace_hint_mode": "target",
+            "inverse_tone_mapping": "no",
+            "hdr_compute_peak": "auto",
+        }
+        if self._source_is_hdr:
+            kwargs["gamut_mapping_mode"] = "clip"
+        else:
+            kwargs["gamut_mapping_mode"] = "auto"
+            kwargs["inverse_tone_mapping"] = "yes"
+            kwargs["hdr_compute_peak"] = "no"
+        return kwargs
+
+    def _configure_color_output(self):
+        """Apply the current color/output configuration to the player."""
+        if not self._player:
+            return
+        try:
+            for key, value in self._color_output_kwargs().items():
+                setattr(self._player, key, value)
+            if self._hdr_enabled:
+                src = "HDR" if self._source_is_hdr else "SDR (upconverted)"
+                print(f"[COLOR] Target = HDR, {self._nits} nits (src={src})")
+            else:
+                print("[COLOR] Target = SDR")
+        except Exception as e:
+            print(f"[HDR] Apply error: {e}")
+
     def _ensure_player(self):
         if self._player is not None:
             return True
         try:
-            self._player = _mpv.MPV(
+            kwargs = dict(
                 geometry="1280x720",
                 autofit="1280x720",
                 title="Sonos PC Streamer - Video",
@@ -1190,23 +1236,15 @@ class MainWindow(QMainWindow):
                 gpu_api="d3d11",
                 ytdl=True,
                 ytdl_format="bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestaudio/best",
+                ao="null",
             )
-            self._player.ao = "null"
-            if self._hdr_enabled and self._source_is_hdr:
-                self._player.target_prim = "bt.2020"
-                self._player.target_trc = "pq"
-                self._player.target_peak = self._nits
-                self._player.gamut_mapping_mode = "clip"
-                self._player.target_colorspace_hint = "yes"
-                self._player.target_colorspace_hint_mode = "target"
-                print(f"[MPV] HDR target: bt.2020/pq, {self._nits}nits (source is HDR)")
+            kwargs.update(self._color_output_kwargs())
+            self._player = _mpv.MPV(**kwargs)
+            if self._hdr_enabled:
+                src = "HDR" if self._source_is_hdr else "SDR (upconverted)"
+                print(f"[MPV] Player created with HDR output {self._nits}nits (src={src})")
             else:
-                self._player.gamut_mapping_mode = "auto"
-                self._player.target_colorspace_hint = "no"
-                if self._hdr_enabled:
-                    print("[MPV] HDR enabled but source is SDR — using SDR output")
-                else:
-                    print("[MPV] HDR target: default (SDR)")
+                print("[MPV] Player created with SDR output")
             print("[MPV] Player created via libmpv")
             return True
         except Exception as e:
@@ -1219,34 +1257,14 @@ class MainWindow(QMainWindow):
         self.hdr_btn.setText("HDR: ON" if checked else "HDR: OFF")
         self.nits_spin.setEnabled(checked)
         save_settings({"hdr_enabled": checked, "nits": self._nits})
-        self._apply_hdr_settings()
+        self._configure_color_output()
         print(f"[HDR] Toggle: {'ON' if checked else 'OFF'}")
 
     def _on_nits_changed(self, value):
         self._nits = value
         save_settings({"hdr_enabled": self._hdr_enabled, "nits": self._nits})
-        self._apply_hdr_settings()
+        self._configure_color_output()
         print(f"[HDR] Nits set to {value}")
-
-    def _apply_hdr_settings(self):
-        if not self._player:
-            return
-        try:
-            if self._hdr_enabled and self._source_is_hdr:
-                self._player.target_prim = "bt.2020"
-                self._player.target_trc = "pq"
-                self._player.target_peak = self._nits
-                self._player.gamut_mapping_mode = "clip"
-                self._player.target_colorspace_hint = "yes"
-                self._player.target_colorspace_hint_mode = "target"
-            else:
-                self._player.target_prim = "auto"
-                self._player.target_trc = "auto"
-                self._player.target_peak = "auto"
-                self._player.gamut_mapping_mode = "auto"
-                self._player.target_colorspace_hint = "no"
-        except Exception as e:
-            print(f"[HDR] Apply error: {e}")
 
     def _log_color_info(self):
         """Log actual color state after content is loaded."""
@@ -1256,10 +1274,20 @@ class MainWindow(QMainWindow):
         for name in ("current_vo", "target_colorspace_hint",
                       "target_colorspace_hint_mode", "target_prim",
                       "target_trc", "target_peak", "gamut_mapping_mode",
+                      "inverse_tone_mapping", "hdr_compute_peak",
                       "colormatrix", "colorlevels",
                       "hwdec_current"):
             try:
                 val = getattr(self._player, name)
+                parts.append(f"{name}={val}")
+            except Exception:
+                parts.append(f"{name}=n/a")
+        for name in ("video-params/primaries", "video-params/gamma",
+                     "video-params/sig-peak", "video-params/light",
+                     "video-output-params/primaries", "video-output-params/gamma",
+                     "video-output-params/sig-peak", "video-output-params/light"):
+            try:
+                val = self._player._get_property(name)
                 parts.append(f"{name}={val}")
             except Exception:
                 parts.append(f"{name}=n/a")
@@ -1353,7 +1381,6 @@ class MainWindow(QMainWindow):
         )
         if path:
             self.uri_label.setText(path)
-            self._schedule_probe(path)
 
     def on_play(self):
         uri = self.uri_label.text().strip()
@@ -1393,7 +1420,6 @@ class MainWindow(QMainWindow):
                 title = data.get("title", uri)
                 duration = data.get("duration", 0) or 0
                 is_live = data.get("is_live", False) or False
-                # Select audio URL from chosen track
                 tracks = data.get("audio_tracks", [])
                 sel = self._selected_audio_index
                 if sel >= 0 and sel < len(tracks):
@@ -1412,7 +1438,6 @@ class MainWindow(QMainWindow):
                 is_live = False
                 print(f"[PLAY] Local file with cached probe: {title}")
             else:
-                # No cache hit: fall through to current resolve logic
                 _video_url, audio_url, title, duration, is_live, _video_headers = resolve_media_url(uri)
 
                 # Step 2: If yt-dlp failed, scrape the page HTML directly
@@ -1440,7 +1465,7 @@ class MainWindow(QMainWindow):
             if self._probe_data:
                 self._source_is_hdr = self._probe_data.get("is_hdr", False)
             print(f"[PLAY] Source HDR: {self._source_is_hdr}, HDR toggle: {self._hdr_enabled}")
-            self._apply_hdr_settings()
+            self._configure_color_output()
 
             if is_live:
                 self.seek_slider.setEnabled(False)
@@ -1453,6 +1478,14 @@ class MainWindow(QMainWindow):
                 self._player.pause = True
                 self._player.speed = 1.0
                 self._current_speed = 1.0
+                try:
+                    self._player.ytdl_format = (
+                        "bestvideo+bestaudio/best"
+                        if self._source_is_hdr
+                        else "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestaudio/best"
+                    )
+                except Exception:
+                    pass
                 self._player.play(uri)
                 print(f"[MPV] Playing: {title}")
                 self._schedule_color_log.emit()

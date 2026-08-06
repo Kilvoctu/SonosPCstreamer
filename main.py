@@ -41,6 +41,7 @@ stream_port = int(os.getenv("STREAM_PORT", 8002))
 
 audio_uri = None
 audio_seek_offset = 0
+audio_headers = {}
 sonos_playing = False
 ffmpeg_process = None
 ffmpeg_lock = threading.Lock()
@@ -188,7 +189,7 @@ class StreamHandler(BaseHTTPRequestHandler):
         self.handle_stream(head_only=True)
 
     def handle_stream(self, head_only=False):
-        global ffmpeg_process, selected_audio_track
+        global ffmpeg_process, selected_audio_track, audio_headers
         if self.path != "/stream.mp3":
             self.send_error(404)
             return
@@ -204,10 +205,17 @@ class StreamHandler(BaseHTTPRequestHandler):
             print("[STREAM] No audio URI set")
             return
 
+        headers_arg = None
+        if audio_uri.startswith("http") and audio_headers:
+            headers_arg = "".join(f"{k}: {v}\r\n" for k, v in audio_headers.items())
         cmd = [FFMPEG_PATH, "-re"]
+        if headers_arg:
+            cmd += ["-headers", headers_arg]
+        if audio_seek_offset > 0 and not audio_uri.startswith("http"):
+            cmd += ["-ss", str(audio_seek_offset)]      # input seek for local
         cmd += ["-i", audio_uri]
-        if audio_seek_offset > 0:
-            cmd += ["-ss", str(audio_seek_offset)]
+        if audio_seek_offset > 0 and audio_uri.startswith("http"):
+            cmd += ["-ss", str(audio_seek_offset)]      # output seek for URL
         if selected_audio_track >= 0 and not audio_uri.startswith("http"):
             cmd += ["-map", f"0:a:{selected_audio_track}"]
             print(f"[STREAM] Mapping audio stream: 0:a:{selected_audio_track}")
@@ -271,18 +279,19 @@ def stop_sonos_stream():
         pass
 
 
-def set_audio_stream(uri, seek_sec=0):
-    global audio_uri, audio_seek_offset
+def set_audio_stream(uri, seek_sec=0, headers=None):
+    global audio_uri, audio_seek_offset, audio_headers
     audio_uri = uri
     audio_seek_offset = seek_sec
+    audio_headers = headers or {}
     print(f"[AUDIO] Stream offset set to {seek_sec}s")
 
 
 def resolve_media_url(url):
     """Resolve a media URL to direct video + audio CDN URLs.
 
-    Returns (video_url, audio_url, title, duration, is_live, video_headers) or
-    (None, None, None, 0, False, {}) on failure.
+    Returns (video_url, audio_url, title, duration, is_live, video_headers, audio_headers) or
+    (None, None, None, 0, False, {}, {}) on failure.
     """
     try:
         ydl_opts = {
@@ -296,18 +305,20 @@ def resolve_media_url(url):
             info = ydl.extract_info(url, download=False)
             if info is None:
                 print("[RESOLVE] Failed to extract info")
-                return None, None, None, 0, False, {}
+                return None, None, None, 0, False, {}, {}
             video_url = info.get("url")
             audio_url = info.get("url")
             title = info.get("title", "Unknown")
             duration = info.get("duration", 0) or 0
             is_live = info.get("is_live", False) or False
             video_headers = {}
+            audio_headers = {}
             if "formats" in info:
                 best_audio = None
                 for fmt in info["formats"]:
                     if fmt.get("acodec", "none") != "none" and fmt.get("vcodec", "none") == "none":
                         best_audio = fmt
+                audio_headers = best_audio.get("http_headers", {}) if best_audio else {}
                 if best_audio:
                     audio_url = best_audio.get("url", audio_url)
                 best_video = None
@@ -321,10 +332,10 @@ def resolve_media_url(url):
                 else:
                     video_headers = {}
             print(f"[RESOLVE] Resolved: {title} (live={is_live}, dur={duration}s)")
-            return video_url, audio_url, title, duration, is_live, video_headers
+            return video_url, audio_url, title, duration, is_live, video_headers, audio_headers
     except Exception as e:
         print(f"[RESOLVE] Resolution failed: {e}")
-        return None, None, None, 0, False, {}
+        return None, None, None, 0, False, {}, {}
 
 
 def scrape_page_for_media(url):
@@ -541,6 +552,7 @@ def _probe_url_audio_tracks(url):
                         "channels": "",
                         "language": fmt.get("language", ""),
                         "url": fmt_url,
+                        "http_headers": fmt.get("http_headers", {}),
                     })
                     idx += 1
 
@@ -757,6 +769,7 @@ class MainWindow(QMainWindow):
         self._resize_edge = None
         self._RESIZE_MARGIN = 6
         self._is_live = False
+        self._resolved_audio_headers = {}
         self._hdr_enabled = load_settings().get("hdr_enabled", False)
         self._source_is_hdr = False
         self._nits = load_settings().get("nits", 1000)
@@ -1358,12 +1371,21 @@ class MainWindow(QMainWindow):
                     print("[SEEK] WARNING: No resolved audio URL available, seeking mpv only")
                     self._sync_ready = True
                     return
-                set_audio_stream(audio, seek_sec=pos_sec)
+                set_audio_stream(audio, seek_sec=pos_sec, headers=getattr(self, '_resolved_audio_headers', None))
                 start_sonos_stream()
                 sonos_ok = wait_for_sonos_playing()
                 if sonos_ok:
                     seek_base_pos = pos_sec
                     self._sync_ready = True
+                    self._initial_sync_done = True
+                    if self._player:
+                        try:
+                            self._player.pause = False
+                            self._player.seek(pos_sec, "absolute")
+                            self._player.speed = 1.0
+                            self._current_speed = 1.0
+                        except Exception as e:
+                            print(f"[SYNC] Seek resume error: {e}")
                     print(f"[SYNC] Seek: base={pos_sec:.1f}s, monitor will sync")
                 else:
                     if self._player:
@@ -1424,10 +1446,13 @@ class MainWindow(QMainWindow):
                 sel = self._selected_audio_index
                 if sel >= 0 and sel < len(tracks):
                     audio_url = tracks[sel].get("url", uri)
+                    audio_headers = tracks[sel].get("http_headers", {})
                 elif tracks:
                     audio_url = tracks[0].get("url", uri)
+                    audio_headers = tracks[0].get("http_headers", {})
                 else:
                     audio_url = uri
+                    audio_headers = {}
                 print(f"[PLAY] Using cached probe data: {title}")
             elif use_cache and self._probe_data["type"] == "local":
                 # Local file: use raw URI; track index from selected_audio_track
@@ -1436,9 +1461,10 @@ class MainWindow(QMainWindow):
                 title = os.path.basename(uri)
                 duration = 0
                 is_live = False
+                audio_headers = {}
                 print(f"[PLAY] Local file with cached probe: {title}")
             else:
-                _video_url, audio_url, title, duration, is_live, _video_headers = resolve_media_url(uri)
+                _video_url, audio_url, title, duration, is_live, _video_headers, audio_headers = resolve_media_url(uri)
 
                 # Step 2: If yt-dlp failed, scrape the page HTML directly
                 if audio_url is None:
@@ -1458,6 +1484,7 @@ class MainWindow(QMainWindow):
                     print(f"[PLAY] Final audio URL: {audio_url[:120]}...")
 
             self._resolved_audio_url = audio_url
+            self._resolved_audio_headers = audio_headers
             self._is_live = is_live
 
             # Detect source HDR and apply color settings
@@ -1494,15 +1521,20 @@ class MainWindow(QMainWindow):
                 self._status_signal.emit(f"Error: {e}")
                 return
 
-            set_audio_stream(audio_url, seek_sec=0)
+            set_audio_stream(audio_url, seek_sec=0, headers=self._resolved_audio_headers)
             start_sonos_stream()
             sonos_ok = wait_for_sonos_playing()
 
             if is_live:
+                seek_base_pos = 0.0
+                self._sync_ready = True
+                self._initial_sync_done = True
+                self._current_speed = 1.0
                 self._status_signal.emit(f"Playing LIVE: {title}")
                 if self._player:
                     try:
                         self._player.pause = False
+                        self._player.speed = 1.0
                     except Exception:
                         pass
             elif sonos_ok:
@@ -1534,6 +1566,7 @@ class MainWindow(QMainWindow):
         self._is_live = False
         self._source_is_hdr = False
         self._resolved_audio_url = None
+        self._resolved_audio_headers = {}
         self._subtitle_tracks = []
         self._sub_last_track_ids = ()
         self.sub_combo.blockSignals(True)

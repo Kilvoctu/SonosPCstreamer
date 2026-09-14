@@ -1,6 +1,8 @@
-soco
-psutil
-python-dotenv
-python-mpv
-PySide6-Essentials
-yt-dlp
+soco==0.31.2
+psutil==7.2.2
+python-dotenv==1.2.2
+python-mpv==1.0.8
+PySide6-Essentials==6.11.2
+yt-dlp==2026.8.19
+ruff==0.16.7
+# pinned to the versions validated in .venv

@@ -101,6 +101,10 @@ call .venv\Scripts\activate.bat
 
 echo Installing requirements...
 pip install -r requirements.txt
+IF ERRORLEVEL 1 (
+    echo [ERROR] Dependency install failed. Not starting the app.
+    exit /b 1
+)
 
 echo.
 echo Running main.py...

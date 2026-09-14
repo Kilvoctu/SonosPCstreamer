@@ -21,14 +21,15 @@ I made this tool after [my YT streamer](https://github.com/Kilvoctu/SonosYTstrea
 ### Features
 - Supports multiple speakers (one speaker is designated as the coordinator).
 - Supports most video files, online content and live streams (anything that's support by yt-dlp).
-- A/V syncs by adjusting video speed until it's synced.
-- Can set manual video delay to help sync.
-- Can select audio tracks and subtitles, and can seek timestamp and change volume.
+- A/V syncs by subtly adjusting video speed until it's synced.
+- Set manual video delay to help sync.
+- Select audio tracks and subtitles.
+- Seek timestamp and change volume.
 - Supports SDR/HDR
 
 ### Known issues and other things
-- Really janky. Things will randomly not work (playback, seeking, color space, etc.).
-- Audio doesn't always sync properly, and it's not perfectly in sync even when it is (roughly within 200ms).
+- Features may randomly not work (playback, seeking, color space, etc.).
+- Audio takes a while to sync.
 - Doesn't play age-restricted YT content.
 - Probably a bunch of bugs I haven't caught or tested for.
 - Only tested on a pair of Sonos One with an HDR display.

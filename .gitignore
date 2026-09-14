@@ -6,3 +6,4 @@ mpv-bin
 .env
 ytstreamer.py
 settings.json
+.ruff_cache

@@ -1,0 +1,11 @@
+# Ruff linter configuration. Rules follow ruff's default set (0.16+).
+target-version = "py310"
+
+[lint]
+# BLE001 (broad `except Exception:`) is disabled: this codebase deliberately
+# uses wide exception handling around mpv/Qt/network integration seams where a
+# specific exception list would be impractical and fragile. Sine qua non:
+# S110/S112 silent `except: pass/continue` blocks stay enabled and MUST log.
+# B013 (non-empty except tuple) is disabled because the codebase writes the
+# except clause as an explicit singleton tuple on purpose.
+ignore = ["BLE001", "B013"]

@@ -12,16 +12,17 @@ I made this tool after [my YT streamer](https://github.com/Kilvoctu/SonosYTstrea
 - Run `run.bat`. It will set up the .env, create a local Python environment, download ffmpeg and mpv, then run the app.
 
 ### Usage
-- Run `run.bat`. 
+- Run `run.bat`.
+- Open `≡` menu
 - Browse to a video file or paste a YT link 
 - Check audio track, etc.
-- Click Play.
-- Hope that an MPV window opens with the video.
+- Click play.
 
 ### Features
 - Supports multiple speakers (one speaker is designated as the coordinator).
 - Supports most video files, online content and live streams (anything that's support by yt-dlp).
 - A/V syncs by adjusting video speed until it's synced.
+- Can set manual video delay to help sync.
 - Can select audio tracks and subtitles, and can seek timestamp and change volume.
 - Supports SDR/HDR
 

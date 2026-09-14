@@ -7,9 +7,15 @@ I made this tool after [my YT streamer](https://github.com/Kilvoctu/SonosYTstrea
 
 
 ### Setup
+- Windows only (the setup tooling is Windows-specific)
 - Have Python 3.10 at least
 - Know your speaker IP address
 - Run `run.bat`. It will set up the .env, create a local Python environment, download ffmpeg and mpv, then run the app.
+
+### Config
+`.env` is created next to the app by `run.bat`:
+- `SONOS_IP` — required; the coordinator speaker's IP address
+- `STREAM_PORT` — optional; local streaming port (default `8002`)
 
 ### Usage
 - Run `run.bat`.
@@ -33,3 +39,9 @@ I made this tool after [my YT streamer](https://github.com/Kilvoctu/SonosYTstrea
 - Doesn't play age-restricted YT content.
 - Probably a bunch of bugs I haven't caught or tested for.
 - Only tested on a pair of Sonos One with an HDR display.
+
+### Credits
+Powered by [ffmpeg](https://ffmpeg.org), [mpv](https://mpv.io), [yt-dlp](https://github.com/yt-dlp/yt-dlp), [SoCo](https://github.com/SoCo/SoCo) and [PySide6](https://doc.qt.io/qtforpython-6/).
+
+### License
+MIT — see [LICENSE](LICENSE).

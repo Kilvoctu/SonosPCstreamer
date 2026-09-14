@@ -2,5 +2,5 @@ soco
 psutil
 python-dotenv
 python-mpv
-PyQt5
+PySide6-Essentials
 yt-dlp

@@ -27,6 +27,7 @@ I made this tool after [my YT streamer](https://github.com/Kilvoctu/SonosYTstrea
 
 ### Known issues and other things
 - Really janky. Things will randomly not work (playback, seeking, color space, etc.).
-- Audio doesn't always sync properly, and it's not perfectly in sync even when it is (roughly within 500ms).
+- Audio doesn't always sync properly, and it's not perfectly in sync even when it is (roughly within 200ms).
+- Doesn't play age-restricted YT content.
 - Probably a bunch of bugs I haven't caught or tested for.
 - Only tested on a pair of Sonos One with an HDR display.
